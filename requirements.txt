@@ -1,6 +1,6 @@
 langgraph
 langgraph-sdk
-langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
 langsmith
 langchain-community
 langchain-core

@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 import os
+from langgraph.prebuilt import ToolNode
 import time
 import uuid
 from typing import Callable
@@ -50,6 +51,8 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+llm = ChatOpenAI(model="gpt-4o-mini") 
 
 def infer_column_types(df):
     """Infer SQL column types from DataFrame"""
@@ -178,6 +181,7 @@ class GenerateAnalystsState(TypedDict):
     csv_path: str 
     analysis_goal: str  
     max_analysts: int
+    user_query: Optional[str]
     human_analyst_feedback: Optional[str]
     database_name: Optional[str] 
     table_name: Optional[str]  
@@ -305,11 +309,11 @@ def process_csv_and_create_db(state: GenerateAnalystsState):
             table_name=state.get('table_name')
         )
         
-        # Convert DataFrame to a serializable format
+        # Store DataFrame as a serializable dict
         state["data_df"] = {"raw": df.to_dict(orient="records")}
         
         return {
-            'data_df': state["data_df"],
+            "data_df": state["data_df"],
             "database_name": db_info['database_name'],
             "table_name": db_info['table_name'],
             "database_schema": db_info['schema']
@@ -323,35 +327,18 @@ def process_csv_and_create_db(state: GenerateAnalystsState):
 import json
 def create_analysts(state: GenerateAnalystsState):
     """Create analysts based on the dataset and analysis goals"""
-    try:
-        if isinstance(state["data_df"], str):  
-            state["data_df"] = json.loads(state["data_df"]) 
-
-        if not isinstance(state["data_df"], dict):
-            raise ValueError("data_df is not a valid dictionary")
-
-    except Exception as e:
-        print(f"⚠️ Error parsing data_df: {e}")
-        state["data_df"] = {}
-
-  
+    if "data_df" not in state or "raw" not in state["data_df"]:
+        return {"error_message": "No raw data available to create analysts"}
+    
     db_info = f"Database: {state['database_name']}, Table: {state['table_name']}"
     schema_info = "Schema: " + ", ".join([f"{k}: {v}" for k, v in state.get("database_schema", {}).items()])
+    data_sample = "Sample data: " + str(state["data_df"]["raw"][:3])  # First 3 records
     
-    data_sample = "Sample data: (No valid data found)"
-    if "raw" in state["data_df"]:
-        try:
-            data_sample = "Sample data: " + str(state["data_df"]["raw"].head(3).to_dict())
-        except AttributeError:
-            print("⚠️ 'raw' key is present but not a DataFrame. Ensure correct format.")
-
     goal = f"{db_info}\n{schema_info}\n{data_sample}\n\nAnalysis Goal: {state['analysis_goal']}"
     max_analysts = int(state.get("max_analysts", 4))
     human_analyst_feedback = state.get("human_analyst_feedback", "")
 
-  
     structured_llm = llm.with_structured_output(Perspectives)
-
     
     system_message = analyst_instructions.format(
         analyst_goal=goal,
@@ -359,13 +346,11 @@ def create_analysts(state: GenerateAnalystsState):
         max_analysts=max_analysts
     )
 
-   
     perspectives = structured_llm.invoke([
         SystemMessage(content=system_message),
         HumanMessage(content="Generate the set of analysts that will create and interact with the database, analyze the data, clean it, visualize it, perform data engineering tasks, and build machine learning models.")
     ])
     
-   
     return {"analysts": perspectives.analysts, "analysis_summary": perspectives.analysis_summary}
 
 def perform_database_interactions(state: GenerateAnalystsState):
@@ -517,73 +502,80 @@ def data_cleaning_and_enrichment(state: GenerateAnalystsState):
     finally:
         db.close()
         
-def data_visualization(state):
-    """Create visualizations of the data"""
-    # Validate input data structure
-    if not isinstance(state.get("data_df"), dict) or "cleaned" not in state["data_df"]:
-        return {"error_message": "Invalid data format: 'data_df' must be a dictionary with a 'cleaned' key."}
+def data_visualization(state: GenerateAnalystsState):
+    """Create enhanced, interactive visualizations based on user query"""
+    if "data_df" not in state or "cleaned" not in state["data_df"]:
+        return {"error_message": "No cleaned data available for visualization"}
     
-    clean_df = state["data_df"]["cleaned"]
-    
-    # Ensure clean_df is a DataFrame
-    if not isinstance(clean_df, pd.DataFrame):
-        return {"visualizations": json.dumps(clean_df, default=str)}  # Convert non-DataFrame objects to JSON-friendly format
-
+    clean_df = pd.DataFrame(state["data_df"]["cleaned"])
     visualizations = {}
     
-    # Create directory for visualizations
     viz_dir = os.path.join(settings.upload_folder, 'visualizations')
     os.makedirs(viz_dir, exist_ok=True)
-    
-    # Prefix for filenames
     viz_prefix = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Select numeric columns
-    numeric_cols = clean_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+    numeric_cols = clean_df.select_dtypes(include=['float64', 'int64']).columns
+    categorical_cols = clean_df.select_dtypes(include=['object']).columns
     
-    # Correlation Heatmap
-    if len(numeric_cols) > 1:
-        plt.figure(figsize=(10, 8))
+    # Dynamic visualization based on user query
+    user_query = state.get("user_query", "").lower()
+    
+    # 1. Interactive Scatter Matrix
+    if len(numeric_cols) >= 2:
+        fig = px.scatter_matrix(
+            clean_df,
+            dimensions=numeric_cols[:4],
+            title="Scatter Matrix of Numeric Features",
+            height=800
+        )
+        scatter_file = f"{viz_dir}/{viz_prefix}_scatter_matrix.html"
+        fig.write_html(scatter_file)
+        visualizations['scatter_matrix'] = scatter_file
+
+    # 2. Distribution Plot with Statistics
+    if numeric_cols and ("distribution" in user_query or not user_query):
+        for col in numeric_cols[:3]:
+            fig = px.histogram(
+                clean_df,
+                x=col,
+                marginal="box",
+                title=f"Distribution of {col}",
+                hover_data=clean_df.columns,
+                height=600
+            )
+            dist_file = f"{viz_dir}/{viz_prefix}_dist_{col}.html"
+            fig.write_html(dist_file)
+            visualizations[f'dist_{col}'] = dist_file
+
+    # 3. Correlation Heatmap
+    if len(numeric_cols) > 1 and ("correlation" in user_query or not user_query):
         corr = clean_df[numeric_cols].corr()
-        sns.heatmap(corr, annot=True, cmap='coolwarm')
-        plt.title('Correlation Heatmap')
-        plt.tight_layout()
-        corr_file = os.path.join(viz_dir, f'{viz_prefix}_correlation_heatmap.png')
-        plt.savefig(corr_file)
-        plt.close()
+        fig = px.imshow(
+            corr,
+            text_auto=True,
+            aspect="auto",
+            title="Correlation Heatmap",
+            height=600
+        )
+        corr_file = f"{viz_dir}/{viz_prefix}_correlation.html"
+        fig.write_html(corr_file)
         visualizations['correlation'] = corr_file
-    
-    # Distribution Plots
-    for col in numeric_cols[:3]:
-        plt.figure(figsize=(8, 6))
-        sns.histplot(clean_df[col], kde=True)
-        plt.title(f'Distribution of {col}')
-        dist_file = os.path.join(viz_dir, f'{viz_prefix}_dist_{col}.png')
-        plt.savefig(dist_file)
-        plt.close()
-        visualizations[f'dist_{col}'] = dist_file
-    
-    # Pair Plot
-    if len(numeric_cols) > 1:
-        plot_cols = numeric_cols[:min(4, len(numeric_cols))]
-        sns_pairplot = sns.pairplot(clean_df[plot_cols])
-        pair_file = os.path.join(viz_dir, f'{viz_prefix}_pair_plot.png')
-        sns_pairplot.savefig(pair_file)
-        plt.close()
-        visualizations['pair_plot'] = pair_file
-    
-    # Box Plots
-    if numeric_cols:
-        plt.figure(figsize=(12, 6))
-        sns.boxplot(data=clean_df[numeric_cols[:min(6, len(numeric_cols))]])
-        plt.title('Box Plots of Numeric Features')
-        plt.xticks(rotation=45)
-        box_file = os.path.join(viz_dir, f'{viz_prefix}_box_plots.png')
-        plt.savefig(box_file)
-        plt.close()
-        visualizations['box_plots'] = box_file
-    
-    return {"visualizations": json.dumps(visualizations)} 
+
+    # 4. Categorical Analysis
+    if categorical_cols and ("category" in user_query or not user_query):
+        for col in categorical_cols[:2]:
+            fig = px.bar(
+                clean_df[col].value_counts().reset_index(),
+                x=col,
+                y="count",
+                title=f"Distribution of {col}",
+                height=600
+            )
+            bar_file = f"{viz_dir}/{viz_prefix}_bar_{col}.html"
+            fig.write_html(bar_file)
+            visualizations[f'bar_{col}'] = bar_file
+
+    return {"visualizations": visualizations}
 
 def build_ml_models(state: GenerateAnalystsState):
     """Build machine learning models based on the cleaned data"""
@@ -677,192 +669,98 @@ def build_ml_models(state: GenerateAnalystsState):
 
 
 def generate_analysis_report(state: GenerateAnalystsState):
-    """Generate a comprehensive analysis report based on all the previous steps"""
-    
-    # Debug information
-    print("Starting generate_analysis_report")
-    print(f"ml_models type: {type(state.get('ml_models'))}")
-    
-    # Extract relevant information from state with safer gets
+    """Generate a detailed, formatted analysis report"""
     analysts = state.get('analysts', [])
     data_df = state.get('data_df', {})
     visualizations = state.get('visualizations', {})
     ml_models = state.get('ml_models', {})
     database_name = state.get('database_name', 'unknown')
-    table_name = state.get('table_name', 'unknown')
-    cleaned_table_name = state.get('cleaned_table_name', 'None')
-    database_interactions = state.get('database_interactions', [])
+    user_query = state.get('user_query', 'General analysis')
+
+    # Process data
+    cleaned_df = pd.DataFrame(data_df.get('cleaned', [])) if 'cleaned' in data_df else None
     
-    # Handle ml_models being a string or other non-dict type
-    if not isinstance(ml_models, dict):
-        print(f"Converting ml_models from {type(ml_models)} to dict")
-        ml_models = {'error': str(ml_models)}
+    report = f"""
+    # Comprehensive Data Analysis Report
+    *Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+    *Analysis Focus: {user_query}*
+
+    ## Dataset Overview
+    - **Database**: {database_name}
+    - **Rows**: {len(cleaned_df) if cleaned_df is not None else 'N/A'}
+    - **Columns**: {', '.join(cleaned_df.columns) if cleaned_df is not None else 'N/A'}
+    """
     
-    # Generate summaries for each analyst based on their focus area
+    # Data Statistics
+    if cleaned_df is not None:
+        numeric_cols = cleaned_df.select_dtypes(include=['float64', 'int64']).columns
+        if numeric_cols.any():
+            stats = cleaned_df[numeric_cols].describe().to_dict()
+            report += "\n## Key Statistics\n"
+            for col, stat_dict in stats.items():
+                report += f"- **{col}**:\n"
+                report += f"  - Mean: {stat_dict['mean']:.2f}\n"
+                report += f"  - Min: {stat_dict['min']:.2f}\n"
+                report += f"  - Max: {stat_dict['max']:.2f}\n"
+
+    # Visualizations
+    if visualizations:
+        report += "\n## Visualizations\n"
+        for viz_type, path in visualizations.items():
+            report += f"- [{viz_type.replace('_', ' ').title()}]({path})\n"
+
+    # ML Models
+    if ml_models and isinstance(ml_models, dict) and 'error' not in ml_models:
+        report += "\n## Machine Learning Insights\n"
+        for model_name, info in ml_models.items():
+            report += f"- **{model_name.replace('_', ' ').title()}**\n"
+            report += f"  - Training Score: {info.get('train_score', 'N/A'):.3f}\n"
+            report += f"  - Test Score: {info.get('test_score', 'N/A'):.3f}\n"
+            report += f"  - Target: {info.get('target', 'N/A')}\n"
+
+    # Analyst Contributions
+    report += "\n## Analyst Contributions\n"
     for analyst in analysts:
-        if not hasattr(analyst, 'analysis_results') or analyst.analysis_results is None:
-            analyst.analysis_results = {}
-        
-        if hasattr(analyst, 'data_analysis_focus'):
-            focus = analyst.data_analysis_focus
-        else:
-            focus = "Unknown"
-            
-        print(f"Processing analyst with focus: {focus}")
-            
-        if isinstance(focus, str) and "Database" in focus:
-            analyst.analysis_results['database_summary'] = {
-                'database_created': database_name,
-                'tables_created': [table_name, cleaned_table_name],
-                'interactions_count': len(database_interactions)
-            }
-        
-        elif isinstance(focus, str) and "Data Engineering" in focus:
-            if isinstance(data_df, dict) and 'cleaned' in data_df and 'raw' in data_df:
-                rows_before = len(data_df['raw'])
-                rows_after = len(data_df['cleaned'])
-                analyst.analysis_results['data_cleaning'] = {
-                    'rows_before': rows_before,
-                    'rows_after': rows_after,
-                    'cleaning_efficiency': f"{(rows_after/rows_before*100):.1f}%",
-                    'cleaned_table': cleaned_table_name
-                }
-        
-        elif isinstance(focus, str) and "Visualization" in focus:
-            if isinstance(visualizations, dict):
-                analyst.analysis_results['visualizations'] = list(visualizations.keys())
-            else:
-                analyst.analysis_results['visualizations'] = []
-            
-        elif isinstance(focus, str) and "Machine Learning" in focus:
-            if isinstance(ml_models, dict) and 'error' not in ml_models:
-                for model_name, model_info in ml_models.items():
-                    if model_name != 'error' and isinstance(model_info, dict):
-                        try:
-                            analyst.analysis_results[model_name] = {
-                                'train_score': model_info.get('train_score', 'N/A'),
-                                'test_score': model_info.get('test_score', 'N/A'),
-                                'target': model_info.get('target', 'N/A')
-                            }
-                        except Exception as e:
-                            print(f"Error processing model {model_name}: {str(e)}")
-                            analyst.analysis_results[model_name] = {'error': str(e)}
+        report += f"- **{analyst.name}** ({analyst.data_analysis_focus})\n"
+        for key, value in (analyst.analysis_results or {}).items():
+            report += f"  - {key}: {value}\n"
+
+    return {"analysis_summary": report}
+
+
+tools = [
+    perform_database_interactions,
+    data_cleaning_and_enrichment,
+    data_visualization,
+    build_ml_models,
+    generate_analysis_report
+]
+
+llm_with_tools = ChatOpenAI(model="gpt-4o-mini").bind_tools(tools)
+
+def decide_next_step(state: GenerateAnalystsState):
+    """Use LLM with tool calling to decide the next step based on user query."""
+    query = state.get("user_query", "Perform a general analysis of the data")
     
-    # Safely get data properties
-    try:
-        raw_rows = len(data_df['raw']) if isinstance(data_df, dict) and 'raw' in data_df else 'N/A'
-    except:
-        raw_rows = 'N/A'
-        
-    try:
-        cleaned_rows = len(data_df['cleaned']) if isinstance(data_df, dict) and 'cleaned' in data_df else 'N/A'
-    except:
-        cleaned_rows = 'N/A'
-        
-    try:
-        features = ', '.join(data_df['raw'].columns) if isinstance(data_df, dict) and 'raw' in data_df else 'N/A'
-    except:
-        features = 'N/A'
-  
-    # Build the report
-    try:
-        analysis_goal = state.get('analysis_goal', 'Unknown')
-        analysis_summary = f"""
-        ## Data Analysis Report for {analysis_goal}
-        
-        ### Database Information
-        - Database name: {database_name}
-        - Original table: {table_name}
-        - Cleaned data table: {cleaned_table_name}
-        
-        ### Data Overview
-        - Raw data rows: {raw_rows}
-        - Cleaned data rows: {cleaned_rows}
-        - Features: {features}
-        
-        ### Database Interactions
-        - Total interactions: {len(database_interactions)}
-        """
-        
-        # Add visualizations info
-        if isinstance(visualizations, dict) and visualizations:
-            try:
-                analysis_summary += f"""
-                ### Key Visualizations
-                - Created {len(visualizations)} visualizations:
-                  - {', '.join(visualizations.keys())}
-                """
-            except Exception as e:
-                analysis_summary += f"""
-                ### Key Visualizations
-                - Error processing visualizations: {str(e)}
-                """
-        
-        # Add ML model info
-        if isinstance(ml_models, dict):
-            if 'error' not in ml_models:
-                try:
-                    model_summaries = []
-                    for model_name, model_info in ml_models.items():
-                        if model_name != 'error' and isinstance(model_info, dict):
-                            model_summaries.append(
-                                f"- {model_name.replace('_', ' ').title()}: "
-                                f"Test score: {model_info.get('test_score', 'N/A')}, "
-                                f"Target: {model_info.get('target', 'N/A')}"
-                            )
-                    
-                    if model_summaries:
-                        analysis_summary += f"""
-                        ### Machine Learning Models
-                        {chr(10).join(model_summaries)}
-                        """
-                    else:
-                        analysis_summary += f"""
-                        ### Machine Learning Models
-                        No valid models found.
-                        """
-                except Exception as e:
-                    analysis_summary += f"""
-                    ### Machine Learning Models
-                    Error processing models: {str(e)}
-                    """
-            else:
-                analysis_summary += f"""
-                ### Machine Learning Models
-                - Error occurred: {ml_models.get('error', 'Unknown error')}
-                """
-        else:
-            analysis_summary += f"""
-            ### Machine Learning Models
-            - Error: ml_models is not a dictionary (type: {type(ml_models)})
-            """
-        
-        # Add analyst contributions
-        try:
-            analyst_contribs = []
-            for a in analysts:
-                if hasattr(a, 'name') and hasattr(a, 'data_analysis_focus') and hasattr(a, 'analysis_results'):
-                    results = list(a.analysis_results.keys()) if a.analysis_results else 'No results'
-                    analyst_contribs.append(f"- {a.name} ({a.data_analysis_focus}): {results}")
-                else:
-                    analyst_contribs.append(f"- Analyst with incomplete attributes")
-            
-            analysis_summary += f"""
-            ### Analyst Contributions
-            {''.join([f"{contrib}\n" for contrib in analyst_contribs])}
-            """
-        except Exception as e:
-            analysis_summary += f"""
-            ### Analyst Contributions
-            Error processing analyst contributions: {str(e)}
-            """
-        
-        print("Successfully generated analysis report")
-        return {"analysis_summary": analysis_summary}
-    except Exception as e:
-        error_msg = f"Error generating analysis report: {str(e)}"
-        print(error_msg)
-        return {"analysis_summary": error_msg}
+    system_prompt = """
+    You are an intelligent assistant tasked with deciding the next step in a data analysis workflow based on a user query.
+    Use the available tools to choose the appropriate action. If the query is unclear, default to generating a report.
+    Query: {query}
+    """
+    
+    messages = [
+        SystemMessage(content=system_prompt.format(query=query)),
+        HumanMessage(content=f"What should be the next step for this query: {query}?")
+    ]
+    
+    response = llm_with_tools.invoke(messages)
+    
+    # Extract tool call from response
+    if response.tool_calls:
+        tool_name = response.tool_calls[0]["name"]
+        return {"next_step": tool_name} 
+    else:
+        return {"next_step": "generate_analysis_report"}
 
 
 def build_analysis_workflow():
@@ -871,35 +769,44 @@ def build_analysis_workflow():
     # Define nodes
     builder.add_node("process_csv_and_create_db", process_csv_and_create_db)
     builder.add_node("create_analysts", create_analysts)
+    builder.add_node("decide_next_step", decide_next_step)
     builder.add_node("perform_database_interactions", perform_database_interactions)
     builder.add_node("data_cleaning_and_enrichment", data_cleaning_and_enrichment)
     builder.add_node("data_visualization", data_visualization)
     builder.add_node("build_ml_models", build_ml_models)
     builder.add_node("generate_analysis_report", generate_analysis_report)
     
+    # Tool node to handle tool execution
+    tool_node = ToolNode(tools)
+    builder.add_node("tools", tool_node)
+    
     # Define workflow edges
     builder.add_edge(START, "process_csv_and_create_db")
     builder.add_edge("process_csv_and_create_db", "create_analysts")
+    builder.add_edge("create_analysts", "decide_next_step")
     
-    # Directly proceed to perform_database_interactions after create_analysts
-    builder.add_edge("create_analysts", "perform_database_interactions")
-    
-    # Continue with the rest of the workflow
-    builder.add_edge("perform_database_interactions", "data_cleaning_and_enrichment")
-    builder.add_edge("data_cleaning_and_enrichment", "data_visualization")
-    builder.add_edge("data_visualization", "build_ml_models")
-    builder.add_edge("build_ml_models", "generate_analysis_report")
-    
-    # Directly proceed to END after generate_analysis_report
-    builder.add_edge("generate_analysis_report", END)
-    
-    # Compile the graph
-    memory = MemorySaver()
-    graph = builder.compile(
-        checkpointer=memory
+    # Conditional edges based on LLM decision
+    builder.add_conditional_edges(
+        "decide_next_step",
+        lambda state: state.get("next_step", "generate_analysis_report"),
+        {
+            "perform_database_interactions": "perform_database_interactions",
+            "data_cleaning_and_enrichment": "data_cleaning_and_enrichment",
+            "data_visualization": "data_visualization",
+            "build_ml_models": "build_ml_models",
+            "generate_analysis_report": "generate_analysis_report"
+        }
     )
     
-    return graph
+    # After each tool, go to report generation
+    for node in ["perform_database_interactions", "data_cleaning_and_enrichment", 
+                 "data_visualization", "build_ml_models"]:
+        builder.add_edge(node, "generate_analysis_report")
+    
+    builder.add_edge("generate_analysis_report", END)
+    
+    memory = MemorySaver()
+    return builder.compile(checkpointer=memory)
 
 
 def run_analysis(csv_file_path, analysis_goal, max_analysts=4, database_name=None, table_name=None):
@@ -925,49 +832,63 @@ def run_analysis(csv_file_path, analysis_goal, max_analysts=4, database_name=Non
 
     print("Final results:", results)
     return results
-
-
-llm = ChatOpenAI(model="gpt-4o-mini") 
+ 
 
 
 def main():
-    st.set_page_config(page_title="Multi-Agent RAG System", layout="wide")
-    st.title("📊 Multi-Agent RAG System for Data Analysis")
+    st.set_page_config(page_title="Interactive Data Analysis", layout="wide")
+    st.title("📊 Interactive Multi-Agent Data Analysis System")
     
-    # File upload
-    st.sidebar.header("Upload CSV for Analysis")
+    st.sidebar.header("Data Analysis Control Panel")
     uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+    user_query = st.sidebar.text_input("Ask a question about your data", "")
+    run_button = st.sidebar.button("Run Analysis")
     
-    if uploaded_file:
-        st.sidebar.success("File uploaded successfully! Processing...")
-        
-        # Read the CSV file into a DataFrame
+    if uploaded_file and run_button:
+        csv_file_path = os.path.join(settings.upload_folder, "uploaded_data.csv")
         data = pd.read_csv(uploaded_file)
-        csv_file_path = "uploaded_data.csv"
-        data.to_csv(csv_file_path, index=False) 
+        data.to_csv(csv_file_path, index=False)
         
-        # Run analysis function
-        results = run_analysis(csv_file_path, "Analyze this data")
+        graph = build_analysis_workflow()
+        initial_state = {
+            "csv_path": csv_file_path,
+            "analysis_goal": "Dynamic analysis based on user query",
+            "user_query": user_query,
+            "max_analysts": 4,
+            "data_df": {}
+        }
         
-        # Display results
-        st.sidebar.success("Analysis Workflow Started!")
-        st.write("### Analysis Results")
-        st.write(results)
-    
-    # Query the PostgreSQL database
-    st.sidebar.header("Query the Database")
-    query = st.sidebar.text_area("Enter SQL Query")
-    if st.sidebar.button("Run Query"):
-        if query.strip():
-            try:
-                result = generate_analysis_report(GenerateAnalystsState)
-                st.write("### Query Results")
-                st.dataframe(result)
-            except Exception as e:
-                st.error(f"Error executing query: {e}")
-        else:
-            st.warning("Please enter a query.")
+        thread = {"configurable": {"thread_id": "1"}}
+        results = graph.invoke(initial_state, thread)
+        
+        st.subheader("Analysis Results")
+        
+        if "analysis_summary" in results:
+            st.markdown(results["analysis_summary"])
+        
+        if "visualizations" in results:
+            st.subheader("Visualizations")
+            for viz_name, viz_path in results["visualizations"].items():
+                if os.path.exists(viz_path):
+                    with open(viz_path, 'r') as f:
+                        st.components.v1.html(f.read(), height=600)
+        
+        # Enhanced question answering
+        if user_query and "data_df" in results and "cleaned" in results["data_df"]:
+            df = pd.DataFrame(results["data_df"]["cleaned"])
+            st.subheader("Quick Answer")
+            
+            query_lower = user_query.lower()
+            if "how many" in query_lower:
+                st.write(f"Dataset contains {len(df)} rows")
+            elif "average" in query_lower or "mean" in query_lower:
+                numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+                if numeric_cols.any():
+                    col = numeric_cols[0]
+                    mean_val = df[col].mean()
+                    st.write(f"Average {col}: {mean_val:.2f}")
+            else:
+                st.write("Detailed analysis provided in the report above.")
 
 if __name__ == "__main__":
     main()
-

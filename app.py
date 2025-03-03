@@ -929,6 +929,81 @@ def run_analysis(csv_file_path, analysis_goal, max_analysts=4, database_name=Non
 
 llm = ChatOpenAI(model="gpt-4o-mini") 
 
+def format_analysis_results(results):
+    """Format the analysis results into a structured and visually appealing report."""
+    formatted_results = "## 📊 Analysis Report\n\n"
+
+    # Database Information
+    formatted_results += "### Database Information\n"
+    formatted_results += f"- **Database Name:** {results.get('database_name', 'N/A')}\n"
+    formatted_results += f"- **Table Name:** {results.get('table_name', 'N/A')}\n"
+    formatted_results += f"- **Cleaned Table Name:** {results.get('cleaned_table_name', 'N/A')}\n\n"
+
+    # Data Overview
+    formatted_results += "### Data Overview\n"
+    data_df = results.get('data_df', {})
+    if isinstance(data_df, dict):
+        raw_data = data_df.get('raw', {})
+        if isinstance(raw_data, dict):
+            formatted_results += f"- **Raw Data Rows:** {raw_data.get('row_count', 'N/A')}\n"
+        else:
+            formatted_results += "- **Raw Data Rows:** N/A (Invalid format)\n"
+        
+        cleaned_data = data_df.get('cleaned', {})
+        if isinstance(cleaned_data, dict):
+            formatted_results += f"- **Cleaned Data Rows:** {cleaned_data.get('row_count', 'N/A')}\n"
+        else:
+            formatted_results += "- **Cleaned Data Rows:** N/A (Invalid format)\n"
+        
+        if isinstance(raw_data, dict):
+            formatted_results += f"- **Features:** {', '.join(raw_data.get('columns', []))}\n\n"
+        else:
+            formatted_results += "- **Features:** N/A (Invalid format)\n\n"
+    else:
+        formatted_results += "- **Data Overview:** N/A (Invalid format)\n\n"
+
+    # Analyst Contributions
+    formatted_results += "### Analyst Contributions\n"
+    analysts = results.get('analysts', [])
+    if isinstance(analysts, list):
+        for analyst in analysts:
+            if isinstance(analyst, dict):
+                formatted_results += f"#### {analyst.get('name', 'Unknown Analyst')}\n"
+                formatted_results += f"- **Role:** {analyst.get('role', 'N/A')}\n"
+                formatted_results += f"- **Focus:** {analyst.get('data_analysis_focus', 'N/A')}\n"
+                formatted_results += f"- **Description:** {analyst.get('description', 'N/A')}\n"
+                formatted_results += f"- **Results:** {', '.join(analyst.get('analysis_results', {}).keys()) if analyst.get('analysis_results') else 'No results'}\n\n"
+            else:
+                formatted_results += "- **Analyst:** Invalid format\n\n"
+    else:
+        formatted_results += "- **Analyst Contributions:** N/A (Invalid format)\n\n"
+
+    # Visualizations
+    formatted_results += "### Visualizations\n"
+    visualizations = results.get('visualizations', {})
+    if isinstance(visualizations, dict):
+        for viz_name, viz_path in visualizations.items():
+            formatted_results += f"- **{viz_name}:** [View Visualization]({viz_path})\n"
+    else:
+        formatted_results += "No visualizations generated.\n\n"
+
+    # Machine Learning Models
+    formatted_results += "### Machine Learning Models\n"
+    ml_models = results.get('ml_models', {})
+    if isinstance(ml_models, dict):
+        for model_name, model_info in ml_models.items():
+            if isinstance(model_info, dict):
+                formatted_results += f"#### {model_name.replace('_', ' ').title()}\n"
+                formatted_results += f"- **Train Score:** {model_info.get('train_score', 'N/A')}\n"
+                formatted_results += f"- **Test Score:** {model_info.get('test_score', 'N/A')}\n"
+                formatted_results += f"- **Target Variable:** {model_info.get('target', 'N/A')}\n"
+                formatted_results += f"- **Features:** {', '.join(model_info.get('features', []))}\n\n"
+            else:
+                formatted_results += f"- **{model_name}:** Invalid format\n\n"
+    else:
+        formatted_results += "No machine learning models generated.\n\n"
+
+    return formatted_results
 
 def main():
     st.set_page_config(page_title="Multi-Agent RAG System", layout="wide")
@@ -949,24 +1024,14 @@ def main():
         # Run analysis function
         results = run_analysis(csv_file_path, "Analyze this data")
         
-        # Display results
+        # Ensure results is a dictionary
+        if not isinstance(results, dict):
+            results = {"error_message": "Invalid results format"}
+        
+        # Format and display results
+        formatted_results = format_analysis_results(results)
         st.sidebar.success("Analysis Workflow Started!")
-        st.write("### Analysis Results")
-        st.write(results)
-    
-    # Query the PostgreSQL database
-    st.sidebar.header("Query the Database")
-    query = st.sidebar.text_area("Enter SQL Query")
-    if st.sidebar.button("Run Query"):
-        if query.strip():
-            try:
-                result = generate_analysis_report(GenerateAnalystsState)
-                st.write("### Query Results")
-                st.dataframe(result)
-            except Exception as e:
-                st.error(f"Error executing query: {e}")
-        else:
-            st.warning("Please enter a query.")
+        st.markdown(formatted_results)
 
 if __name__ == "__main__":
     main()
